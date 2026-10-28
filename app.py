@@ -1,254 +1,189 @@
-import time
-from datetime import datetime, timezone
-
 import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# Noman Trading Bot — DEMO / PAPER ONLY
-# No API keys, no order placement, no real trading.
-
+# NOMAN TRADING BOT — PAPER ONLY. No API keys and no real orders.
 BASE = "https://fapi.binance.com"
 st.set_page_config(page_title="Noman Trading Bot", page_icon="📈", layout="wide")
 st.title("📈 Noman Trading Bot")
-st.caption("Binance Futures public market data • Demo only • No real orders")
+st.caption("Binance USDⓈ-M Futures | USDT perpetual scanner | Demo only")
 
-session = requests.Session()
-session.headers.update({"User-Agent": "NomanTradingBot/1.0"})
+@st.cache_resource
+def session():
+    s = requests.Session()
+    s.headers.update({"User-Agent": "NomanTradingBot/3.0"})
+    return s
 
+def api(path, params=None):
+    r = session().get(BASE + path, params=params, timeout=15)
+    r.raise_for_status()
+    return r.json()
 
-def api_get(path, params=None, timeout=12):
-    response = session.get(BASE + path, params=params, timeout=timeout)
-    response.raise_for_status()
-    return response.json()
+@st.cache_data(ttl=1800)
+def symbols():
+    x = api("/fapi/v1/exchangeInfo")
+    return [a["symbol"] for a in x["symbols"]
+            if a.get("quoteAsset") == "USDT" and a.get("contractType") == "PERPETUAL"
+            and a.get("status") == "TRADING"]
 
+@st.cache_data(ttl=45)
+def tickers():
+    return api("/fapi/v1/ticker/24hr")
 
-@st.cache_data(ttl=3600)
-def get_symbols():
-    info = api_get("/fapi/v1/exchangeInfo")
-    return [
-        s["symbol"] for s in info["symbols"]
-        if s.get("quoteAsset") == "USDT"
-        and s.get("contractType") == "PERPETUAL"
-        and s.get("status") == "TRADING"
-    ]
+def candles(symbol, tf, limit=100):
+    raw = api("/fapi/v1/klines", {"symbol": symbol, "interval": tf, "limit": limit})
+    names = ["t","open","high","low","close","volume","ct","qv","trades","taker_buy_base","taker_buy_quote","ignore"]
+    d = pd.DataFrame(raw, columns=names)
+    for c in ["open","high","low","close","volume","qv","taker_buy_base"]:
+        d[c] = pd.to_numeric(d[c], errors="coerce")
+    return d.iloc[:-1].reset_index(drop=True)  # completed candles only
 
-
-@st.cache_data(ttl=30)
-def get_tickers():
-    return api_get("/fapi/v1/ticker/24hr")
-
-
-@st.cache_data(ttl=15)
-def get_klines(symbol, interval="15m", limit=180):
-    raw = api_get("/fapi/v1/klines", {
-        "symbol": symbol, "interval": interval, "limit": limit
-    })
-    cols = [
-        "open_time", "open", "high", "low", "close", "volume",
-        "close_time", "quote_volume", "trades", "taker_buy_base",
-        "taker_buy_quote", "ignore"
-    ]
-    df = pd.DataFrame(raw, columns=cols)
-    for col in ["open", "high", "low", "close", "volume"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
-    df["close_time"] = pd.to_datetime(df["close_time"], unit="ms", utc=True)
-    # Ignore the still-forming last candle.
-    if len(df) > 1:
-        df = df.iloc[:-1].copy()
-    return df.reset_index(drop=True)
-
-
-def indicators(df):
-    d = df.copy()
-    d["ema12"] = d["close"].ewm(span=12, adjust=False).mean()
-    d["ema44"] = d["close"].ewm(span=44, adjust=False).mean()
-    delta = d["close"].diff()
-    gain = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
-    loss = (-delta.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean()
+def indicators(d):
+    d = d.copy()
+    d["ema12"] = d.close.ewm(span=12, adjust=False).mean()
+    d["ema44"] = d.close.ewm(span=44, adjust=False).mean()
+    ch = d.close.diff()
+    gain = ch.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
+    loss = (-ch.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean()
     rs = gain / loss.replace(0, np.nan)
-    d["rsi"] = 100 - (100 / (1 + rs))
-    ema12 = d["close"].ewm(span=12, adjust=False).mean()
-    ema26 = d["close"].ewm(span=26, adjust=False).mean()
-    macd = ema12 - ema26
+    d["rsi"] = 100 - 100/(1+rs)
+    macd = d.close.ewm(span=12, adjust=False).mean() - d.close.ewm(span=26, adjust=False).mean()
     d["macd_hist"] = macd - macd.ewm(span=9, adjust=False).mean()
-    tr = pd.concat([
-        d["high"] - d["low"],
-        (d["high"] - d["close"].shift()).abs(),
-        (d["low"] - d["close"].shift()).abs()
-    ], axis=1).max(axis=1)
-    d["atr"] = tr.ewm(alpha=1/14, adjust=False).mean()
+    d["vol_avg"] = d.volume.rolling(20).mean()
+    d["vol_ratio"] = d.volume / d.vol_avg.replace(0, np.nan)
+    d["buy_ratio"] = d.taker_buy_base / d.volume.replace(0, np.nan)
     return d
 
-
-def make_signal(df):
-    d = indicators(df).dropna()
-    if len(d) < 5:
-        return "WAIT", d.iloc[-1]
+def trend(symbol, tf):
+    d = indicators(candles(symbol, tf, 80)).dropna()
+    if len(d) < 2: return "N/A"
     x = d.iloc[-1]
-    if x["close"] > x["ema12"] > x["ema44"] and x["rsi"] > 52 and x["macd_hist"] > 0:
-        return "LONG", x
-    if x["close"] < x["ema12"] < x["ema44"] and x["rsi"] < 48 and x["macd_hist"] < 0:
-        return "SHORT", x
-    return "WAIT", x
+    if x.close > x.ema12 > x.ema44 and x.macd_hist > 0: return "UP"
+    if x.close < x.ema12 < x.ema44 and x.macd_hist < 0: return "DOWN"
+    return "SIDE"
 
+def scan(symbol, tf, vol24):
+    try:
+        d = indicators(candles(symbol, tf, 100)).dropna()
+        if len(d) < 22: return None
+        x, p = d.iloc[-1], d.iloc[-2]
+        br = float(x.buy_ratio) if pd.notna(x.buy_ratio) else .5
+        vr = float(x.vol_ratio) if pd.notna(x.vol_ratio) else 0
+        h1, h4 = trend(symbol, "1h"), trend(symbol, "4h")
+        long_score = sum([
+            x.close > x.ema12, x.ema12 > x.ema44, x.rsi > 52,
+            x.macd_hist > 0, br > .55, vr >= 1.5 and x.close > p.close,
+            h1 == "UP", h4 == "UP"])
+        short_score = sum([
+            x.close < x.ema12, x.ema12 < x.ema44, x.rsi < 48,
+            x.macd_hist < 0, br < .45, vr >= 1.5 and x.close < p.close,
+            h1 == "DOWN", h4 == "DOWN"])
+        sig = "WAIT"
+        if long_score >= 6 and long_score >= short_score + 2: sig = "LONG"
+        elif short_score >= 6 and short_score >= long_score + 2: sig = "SHORT"
+        pressure = "Buyers" if br > .55 else ("Sellers" if br < .45 else "Balanced")
+        return {"Coin":symbol, "Signal":sig, "Long score":f"{long_score}/8",
+                "Short score":f"{short_score}/8", "Price":float(x.close),
+                "RSI":round(float(x.rsi),1), "Volume / 20 avg":round(vr,2),
+                "Taker buy %":round(br*100,1), "Pressure":pressure,
+                "1h trend":h1, "4h trend":h4, "24h Volume USDT":float(vol24)}
+    except Exception:
+        return None
 
-def two_minute_reversal(symbol):
-    # Binance Futures has no native 2m interval. Aggregate completed 1m candles.
-    raw = api_get("/fapi/v1/klines", {"symbol": symbol, "interval": "1m", "limit": 12})
-    cols = ["t", "o", "h", "l", "c", "v", "ct", "qv", "n", "tb", "tq", "ig"]
-    d = pd.DataFrame(raw, columns=cols)
-    for c in ["o", "h", "l", "c", "v"]:
-        d[c] = pd.to_numeric(d[c], errors="coerce")
-    d["t"] = pd.to_datetime(d["t"], unit="ms", utc=True)
-    d = d.iloc[:-1].copy()  # discard current incomplete 1m candle
-    d["bucket"] = d["t"].dt.floor("2min")
-    agg = d.groupby("bucket").agg(
-        open=("o", "first"), high=("h", "max"), low=("l", "min"),
-        close=("c", "last"), volume=("v", "sum")
-    ).reset_index()
-    if len(agg) < 3:
-        return None, None, None
-    return agg.iloc[-2], agg.iloc[-1], agg
+def two_minute(symbol):
+    # Binance Futures has no native 2m interval; aggregate closed 1m candles.
+    raw = api("/fapi/v1/klines", {"symbol":symbol, "interval":"1m", "limit":8})
+    d = pd.DataFrame(raw, columns=["t","o","h","l","c","v","ct","qv","n","tb","tq","ig"])
+    for c in ["o","h","l","c","v"]: d[c] = pd.to_numeric(d[c], errors="coerce")
+    d["t"] = pd.to_datetime(d.t, unit="ms", utc=True)
+    d = d.iloc[:-1].copy()
+    d["bucket"] = d.t.dt.floor("2min")
+    return d.groupby("bucket").agg(open=("o","first"), close=("c","last")).reset_index()
 
+st.sidebar.header("Market scanner")
+tf = st.sidebar.selectbox("Signal timeframe", ["15m","1h","4h"])
+scope = st.sidebar.radio("Coins", ["All USDT perpetuals","Top 50 by volume"])
+workers = st.sidebar.selectbox("Parallel requests", [2,3,4], index=1)
+st.sidebar.caption("All-contract scan may take time. Requests are limited to reduce API pressure.")
 
-def fmt(x):
-    return f"{x:.8g}"
+st.sidebar.header("Paper trade")
+sym = st.sidebar.text_input("Coin (example ETHUSDT)", "ETHUSDT").upper().strip()
+side = st.sidebar.selectbox("Direction", ["SHORT","LONG"])
+margin = st.sidebar.number_input("Margin ($)", min_value=.1, value=2.0, step=.5)
+lev = st.sidebar.number_input("Leverage (x)", min_value=1, max_value=125, value=10)
+if "paper" not in st.session_state: st.session_state.paper = None
+c1, c2 = st.sidebar.columns(2)
+if c1.button("Start demo"):
+    try:
+        px = float(api("/fapi/v1/ticker/price", {"symbol":sym})["price"])
+        st.session_state.paper = {"symbol":sym,"side":side,"entry":px,"margin":margin,
+                                  "lev":lev,"peak":0.0,"closed":False}
+    except Exception as e: st.sidebar.error(str(e))
+if c2.button("Reset"):
+    st.session_state.paper = None
 
-
-# Sidebar controls
-st.sidebar.header("Scanner settings")
-top_n = st.sidebar.selectbox("কয়েন সংখ্যা", [10, 15, 20, 25], index=1)
-timeframe = st.sidebar.selectbox("Signal timeframe", ["15m", "1h", "4h"], index=0)
-st.sidebar.caption("সিগন্যালের জন্য বন্ধ হওয়া ক্যান্ডেল ব্যবহার করা হয়।")
-
-st.sidebar.header("Demo position settings")
-symbol_input = st.sidebar.text_input("কয়েন (যেমন BTCUSDT)", value="BTCUSDT").upper().strip()
-side = st.sidebar.selectbox("Demo position", ["SHORT", "LONG"])
-entry = st.sidebar.number_input("Entry price", min_value=0.00000001, value=0.20, format="%.8f")
-margin = st.sidebar.number_input("Margin ($)", min_value=0.1, value=2.0, step=0.5)
-leverage = st.sidebar.number_input("Leverage (x)", min_value=1, max_value=125, value=10, step=1)
-tp1 = st.sidebar.number_input("Profit lock starts ($)", min_value=0.1, value=5.0, step=1.0)
-tp2 = st.sidebar.number_input("Next target ($)", min_value=0.1, value=10.0, step=1.0)
-tp3 = st.sidebar.number_input("Final target ($)", min_value=0.1, value=15.0, step=1.0)
-giveback = st.sidebar.slider("Peak profit থেকে কত % ফেরত এলে বন্ধ করবে", 5, 80, 20, 5)
-st.sidebar.caption("এগুলো কেবল ডেমো হিসাব। ফি, funding, slippage ও liquidation ধরা হয়নি।")
-
-if "paper_peak" not in st.session_state:
-    st.session_state.paper_peak = 0.0
-if "paper_closed" not in st.session_state:
-    st.session_state.paper_closed = False
-if "paper_last_symbol" not in st.session_state:
-    st.session_state.paper_last_symbol = ""
-
-if st.sidebar.button("ডেমো ট্রেড নতুন করে শুরু / Reset"):
-    st.session_state.paper_peak = 0.0
-    st.session_state.paper_closed = False
-    st.session_state.paper_last_symbol = symbol_input
-    st.rerun()
-
-if st.session_state.paper_last_symbol != symbol_input:
-    st.session_state.paper_peak = 0.0
-    st.session_state.paper_closed = False
-    st.session_state.paper_last_symbol = symbol_input
-
-# Scanner
-st.subheader("Market scanner")
+st.subheader("🔎 Binance Futures scanner")
 try:
-    tickers = get_tickers()
-    symbols = set(get_symbols())
-    tdf = pd.DataFrame(tickers)
-    tdf = tdf[tdf["symbol"].isin(symbols)].copy()
-    tdf["quoteVolume"] = pd.to_numeric(tdf["quoteVolume"], errors="coerce")
-    tdf = tdf.nlargest(top_n, "quoteVolume")
+    eligible = symbols()
+    td = pd.DataFrame(tickers())
+    td = td[td.symbol.isin(eligible)].copy()
+    td["quoteVolume"] = pd.to_numeric(td.quoteVolume, errors="coerce")
+    td = td.sort_values("quoteVolume", ascending=False)
+    selected = td.symbol.head(50).tolist() if scope.startswith("Top") else td.symbol.tolist()
+    vm = td.set_index("symbol").quoteVolume.to_dict()
+    st.write(f"Eligible contracts: **{len(eligible)}** | Scanning: **{len(selected)}**")
+    bar, status = st.progress(0), st.empty()
     rows = []
-    for sym in tdf["symbol"].tolist():
-        try:
-            candles = get_klines(sym, timeframe, 160)
-            signal, last = make_signal(candles)
-            rows.append({
-                "Coin": sym,
-                "Signal": signal,
-                "Price": fmt(float(last["close"])),
-                "RSI": round(float(last["rsi"]), 1),
-                "EMA 12": fmt(float(last["ema12"])),
-                "EMA 44": fmt(float(last["ema44"])),
-                "24h Volume (USDT)": round(float(
-                    tdf.loc[tdf["symbol"] == sym, "quoteVolume"].iloc[0]
-                ), 0)
-            })
-        except Exception:
-            continue
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(scan,s,tf,vm.get(s,0)) for s in selected]
+        for i, f in enumerate(as_completed(futures), 1):
+            z = f.result()
+            if z: rows.append(z)
+            if i % 8 == 0 or i == len(futures):
+                bar.progress(i/len(futures)); status.caption(f"Scanned {i}/{len(futures)}")
     if rows:
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-    else:
-        st.warning("এখন সিগন্যাল পাওয়া যায়নি। কিছুক্ষণ পর আবার চেষ্টা করুন।")
+        out = pd.DataFrame(rows).sort_values("24h Volume USDT", ascending=False)
+        st.dataframe(out, use_container_width=True, hide_index=True)
+        st.caption("Scores are rule-based confluence, not win probabilities. WAIT means no strong agreement.")
+    else: st.warning("No results returned; try again later.")
 except Exception as e:
-    st.error(f"Market data load হয়নি: {e}")
-    st.info("ইন্টারনেট বা Binance public API সাময়িক ব্যস্ত থাকতে পারে।")
+    st.error(f"Scanner error: {e}")
+    st.info("Binance public API may be busy or rate-limited.")
 
-# Paper trade monitor
-st.subheader("🛡️ Smart Profit Lock — Demo monitor")
-st.write("এটি তোমার দেওয়া Entry, Side, Margin ও Leverage দিয়ে কল্পিত লাভ হিসাব করে। কোনো অর্ডার দেয় না।")
-
-try:
-    sym = symbol_input
-    if not sym.endswith("USDT"):
-        st.warning("কয়েনের নাম USDT দিয়ে শেষ করো, যেমন ETHUSDT।")
-    else:
-        price_data = api_get("/fapi/v1/ticker/price", {"symbol": sym})
-        current_price = float(price_data["price"])
-        notional = margin * leverage
-        qty = notional / entry
-        if side == "LONG":
-            pnl = (current_price - entry) * qty
-        else:
-            pnl = (entry - current_price) * qty
-
-        st.session_state.paper_peak = max(st.session_state.paper_peak, pnl)
-        peak = st.session_state.paper_peak
-        lock_active = peak >= tp1
-        close_now = False
-        reason = "এখনও লাভের সুরক্ষা চালু হয়নি।"
-
-        if not st.session_state.paper_closed and lock_active:
-            protected_floor = max(tp1, peak * (1 - giveback / 100))
-            if pnl <= protected_floor:
-                close_now = True
-                reason = f"লাভ peak ${peak:.2f} থেকে কমে সুরক্ষার সীমা ${protected_floor:.2f}-এ এসেছে।"
-            elif peak >= tp3 and pnl >= tp3:
-                reason = f"TP3 স্তর ${tp3:.2f} পার হয়েছে; রিভার্সাল হলে লাভ সুরক্ষিত করবে।"
-            elif peak >= tp2 and pnl >= tp2:
-                reason = f"TP2 স্তর ${tp2:.2f} পার হয়েছে; আরও লাভের সুযোগ রাখছে।"
-            else:
-                reason = f"Profit Lock চালু। সর্বোচ্চ দেখা লাভ ${peak:.2f}; ফেরত সীমা ${protected_floor:.2f}।"
-
-        if close_now:
-            st.session_state.paper_closed = True
-
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Current price", fmt(current_price))
-        c2.metric("Estimated PnL", f"${pnl:.2f}")
-        c3.metric("Highest PnL seen", f"${peak:.2f}")
-
-        st.write(f"আনুমানিক position value: **${notional:.2f}** | পরিমাণ: **{qty:.6g} {sym.replace('USDT','')}**")
-        if st.session_state.paper_closed:
-            st.error("ডেমো নিয়ম অনুযায়ী ট্রেড বন্ধ হয়েছে। " + reason)
-        elif lock_active:
-            st.success(reason)
-        else:
-            st.info(reason)
-
-        st.caption(
-            "নোট: এই ডেমো মনিটর অ্যাপ খোলা ও refresh চলাকালীন peak profit মনে রাখে। "
-            "অ্যাপ বন্ধ/রিস্টার্ট হলে হিসাব reset হতে পারে। ২ মিনিটের candle Binance-এর 1m candle "
-            "দুটি জুড়ে বিশ্লেষণ করা হয়; এই সংস্করণে live reversal trigger সরল peak-profit giveback "
-            "নিয়ম দিয়ে সিমুলেট করা হয়েছে।"
-        )
-except Exception as e:
-    st.error(f"ডেমো মনিটর চালানো যায়নি: {e}")
+st.subheader("🛡️ Smart Profit Lock — Demo only")
+st.write("Profit milestones: $5 / $10 / $15. A completed 2-minute reversal is used as the exit confirmation.")
+p = st.session_state.paper
+if p is None:
+    st.info("Choose a coin and direction in the sidebar, then press Start demo.")
+else:
+    try:
+        price = float(api("/fapi/v1/ticker/price", {"symbol":p["symbol"]})["price"])
+        notional = p["margin"] * p["lev"]
+        qty = notional / p["entry"]
+        pnl = ((price-p["entry"]) if p["side"]=="LONG" else (p["entry"]-price))*qty
+        p["peak"] = max(p["peak"], pnl)
+        peak = p["peak"]
+        floor = 15.0 if peak >= 15 else (10.0 if peak >= 10 else (5.0 if peak >= 5 else 0.0))
+        bars = two_minute(p["symbol"])
+        reversal = False
+        if len(bars) >= 2:
+            last, prev = bars.iloc[-1], bars.iloc[-2]
+            reversal = (last.close > last.open and last.close > prev.close) if p["side"]=="SHORT" else (last.close < last.open and last.close < prev.close)
+        if not p["closed"] and floor and reversal and pnl >= floor:
+            p["closed"] = True
+            p["exit_note"] = f"2m reversal; estimated paper PnL ${pnl:.2f}"
+        a,b,c = st.columns(3)
+        a.metric("Entry",f"{p['entry']:.8g}"); b.metric("Current",f"{price:.8g}"); c.metric("PnL",f"${pnl:.2f}")
+        d,e,f = st.columns(3)
+        d.metric("Peak PnL",f"${peak:.2f}"); e.metric("Profit floor",f"${floor:.2f}"); f.metric("Position value",f"${notional:.2f}")
+        st.write(f"**{p['symbol']} {p['side']}** | Quantity: {qty:.8g}")
+        if p["closed"]: st.success("Demo position closed: "+p["exit_note"])
+        elif floor: st.info(f"Profit lock active. 2m reversal detected: {reversal}.")
+        else: st.info("Profit lock starts after estimated PnL reaches $5.")
+        st.caption("Paper simulation only. Peak tracking may reset if app sleeps/restarts. Fees, funding, slippage, liquidation and actual order execution are not simulated.")
+    except Exception as e: st.error(f"Paper monitor error: {e}")
 
 st.divider()
-st.caption("ঝুঁকি সতর্কতা: Futures-এ margin হারাতে পারো। এটি শেখা ও পরীক্ষার জন্য, আর্থিক পরামর্শ নয়।")
+st.warning("Futures are high risk. This scanner does not guarantee signals or profits and never places real orders.")
